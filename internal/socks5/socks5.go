@@ -1,5 +1,3 @@
-
-
 // internal/socks5/socks5.go
 package socks5
 
@@ -27,8 +25,8 @@ const (
 	atypIPv6      = 0x04
 
 	// 0-RTT 相关
-	firstDataTimeout = 100 * time.Millisecond // 等待首包数据的时间
-	firstDataMaxSize = 4096                   // 首包最大读取大小
+	firstDataTimeout = 50 * time.Millisecond // 缩短等待时间
+	firstDataMaxSize = 2048                  // 增大首包缓冲
 )
 
 type Server struct {
@@ -36,7 +34,7 @@ type Server struct {
 	tunnel     *tunnel.Tunnel
 	listener   net.Listener
 	logLevel   int
-	optimistic bool // 乐观模式 (0-RTT)
+	optimistic bool
 
 	stopCh chan struct{}
 	wg     sync.WaitGroup
@@ -46,7 +44,7 @@ type Config struct {
 	Addr       string
 	Tunnel     *tunnel.Tunnel
 	LogLevel   string
-	Optimistic bool // 启用乐观模式 (0-RTT)
+	Optimistic bool
 }
 
 func New(cfg Config) *Server {
@@ -67,13 +65,12 @@ func New(cfg Config) *Server {
 	}
 }
 
-// NewSimple 简化构造（兼容旧接口）
 func NewSimple(addr string, t *tunnel.Tunnel, logLevel string) *Server {
 	return New(Config{
 		Addr:       addr,
 		Tunnel:     t,
 		LogLevel:   logLevel,
-		Optimistic: true, // 默认启用优化
+		Optimistic: true,
 	})
 }
 
@@ -141,15 +138,15 @@ func (s *Server) handleConn(conn net.Conn) {
 	}
 }
 
-// handleOptimistic 乐观模式 (0-RTT 优化)
+// handleOptimistic 乐观模式 (改进版)
 func (s *Server) handleOptimistic(conn net.Conn, network, addr string, port uint16) {
-	// 立即发送 SOCKS5 成功响应，不等待隧道确认
+	// 先发送 SOCKS5 成功响应
 	s.sendReply(conn, 0x00)
 
 	// 取消握手超时
 	_ = conn.SetDeadline(time.Time{})
 
-	// 尝试读取首包数据 (0-RTT)
+	// 尝试读取首包数据
 	var initData []byte
 	if network == "tcp" {
 		initData = s.tryReadFirstData(conn)
@@ -158,17 +155,17 @@ func (s *Server) handleOptimistic(conn net.Conn, network, addr string, port uint
 		}
 	}
 
-	// 通过隧道连接 (带初始数据)
+	// 通过隧道连接
 	remote, err := s.tunnel.Connect(tunnel.ConnectOptions{
 		Network:    network,
 		Address:    addr,
 		Port:       port,
 		InitData:   initData,
-		Optimistic: true, // 乐观模式
+		Optimistic: true,
+		Timeout:    15 * time.Second,
 	})
 	if err != nil {
 		s.log(logDebug, "隧道连接失败: %v", err)
-		// 连接已经告诉客户端成功了，只能关闭连接
 		return
 	}
 	defer remote.Close()
@@ -177,14 +174,14 @@ func (s *Server) handleOptimistic(conn net.Conn, network, addr string, port uint
 	s.relay(conn, remote)
 }
 
-// handleStandard 标准模式 (等待确认)
+// handleStandard 标准模式
 func (s *Server) handleStandard(conn net.Conn, network, addr string, port uint16) {
-	// 通过隧道连接
 	remote, err := s.tunnel.Connect(tunnel.ConnectOptions{
 		Network:    network,
 		Address:    addr,
 		Port:       port,
 		Optimistic: false,
+		Timeout:    15 * time.Second,
 	})
 	if err != nil {
 		s.log(logDebug, "隧道连接失败: %v", err)
@@ -193,26 +190,19 @@ func (s *Server) handleStandard(conn net.Conn, network, addr string, port uint16
 	}
 	defer remote.Close()
 
-	// 发送成功响应
 	s.sendReply(conn, 0x00)
-
-	// 取消超时
 	_ = conn.SetDeadline(time.Time{})
-
-	// 双向转发
 	s.relay(conn, remote)
 }
 
 // tryReadFirstData 尝试读取首包数据
 func (s *Server) tryReadFirstData(conn net.Conn) []byte {
-	// 设置短暂的读取超时
 	_ = conn.SetReadDeadline(time.Now().Add(firstDataTimeout))
 	defer conn.SetReadDeadline(time.Time{})
 
 	buf := make([]byte, firstDataMaxSize)
 	n, err := conn.Read(buf)
 	if err != nil {
-		// 超时或无数据都是正常的
 		return nil
 	}
 
@@ -355,7 +345,3 @@ func (s *Server) log(level int, format string, args ...interface{}) {
 	prefix := map[int]string{logError: "[ERROR]", logInfo: "[INFO]", logDebug: "[DEBUG]"}[level]
 	fmt.Printf("%s %s %s\n", prefix, time.Now().Format("15:04:05"), fmt.Sprintf(format, args...))
 }
-
-
-
-
