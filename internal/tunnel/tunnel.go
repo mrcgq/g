@@ -25,6 +25,13 @@ const (
 	CryptoOverhead   = 34
 	ProtocolOverhead = 5
 	SafeMargin       = 100
+	
+	// Connect 请求中 InitData 的最大安全大小
+	// Connect 包结构: Type(1) + ReqID(4) + Network(1) + AddrType(1) + Addr(max 257) + Port(2) + InitData
+	// 安全大小 = MTU - IP/UDP - Crypto - Protocol - Addr = 1500 - 28 - 34 - 270 ≈ 1168
+	// 保守值设为 800，确保不会超限
+	MaxConnectInitData = 800
+	
 	MaxPayloadSize   = DefaultMTU - IPUDPHeaderSize - CryptoOverhead - ProtocolOverhead - SafeMargin
 	RecommendedMTU   = 1300
 
@@ -43,8 +50,8 @@ const (
 // ============================================================================
 
 type sendTask struct {
-	data []byte
-	addr *net.UDPAddr
+	data     []byte
+	priority bool // 高优先级（Connect 包）
 }
 
 // ============================================================================
@@ -236,13 +243,7 @@ func (t *Tunnel) sendWorker() {
 			continue
 		}
 
-		var err error
-		if task.addr != nil {
-			_, err = t.conn.WriteToUDP(task.data, task.addr)
-		} else {
-			_, err = t.conn.Write(task.data)
-		}
-
+		_, err := t.conn.Write(task.data)
 		if err != nil {
 			t.log(logDebug, "发送失败: %v", err)
 		} else {
@@ -265,9 +266,19 @@ func (t *Tunnel) queueSend(data []byte) bool {
 
 func (t *Tunnel) queueSendUrgent(data []byte) {
 	select {
-	case t.sendQueue <- sendTask{data: data}:
+	case t.sendQueue <- sendTask{data: data, priority: true}:
 	case <-t.stopCh:
 	}
+}
+
+// sendDirect 直接发送（用于需要保证顺序的场景）
+func (t *Tunnel) sendDirect(data []byte) error {
+	_, err := t.conn.Write(data)
+	if err == nil {
+		atomic.AddUint64(&t.stats.PacketsSent, 1)
+		atomic.AddUint64(&t.stats.BytesSent, uint64(len(data)))
+	}
+	return err
 }
 
 // ============================================================================
@@ -283,14 +294,27 @@ func (t *Tunnel) Connect(opts ConnectOptions) (io.ReadWriteCloser, error) {
 	reqID := atomic.AddUint32(&t.reqIDCounter, 1)
 	atomic.AddUint64(&t.stats.ConnectRequests, 1)
 
-	// 修复：明确指定类型为 byte
 	var netByte byte = protocol.NetworkTCP
 	if opts.Network == "udp" {
 		netByte = protocol.NetworkUDP
 	}
 
-	// 构建连接请求
-	plain, err := protocol.BuildConnectRequest(reqID, netByte, opts.Address, opts.Port, opts.InitData)
+	// ============ 关键修复：限制 Connect 包中的 InitData 大小 ============
+	var connectInitData []byte
+	var remainingData []byte
+	
+	if len(opts.InitData) > MaxConnectInitData {
+		// InitData 太大，分割处理
+		connectInitData = opts.InitData[:MaxConnectInitData]
+		remainingData = opts.InitData[MaxConnectInitData:]
+		t.log(logDebug, "InitData 分割: %d -> %d + %d", 
+			len(opts.InitData), len(connectInitData), len(remainingData))
+	} else {
+		connectInitData = opts.InitData
+	}
+
+	// 构建连接请求（只包含安全大小的 InitData）
+	plain, err := protocol.BuildConnectRequest(reqID, netByte, opts.Address, opts.Port, connectInitData)
 	if err != nil {
 		return nil, fmt.Errorf("构建请求失败: %w", err)
 	}
@@ -311,11 +335,26 @@ func (t *Tunnel) Connect(opts ConnectOptions) (io.ReadWriteCloser, error) {
 	t.pending.Store(reqID, pc)
 	atomic.AddInt64(&t.stats.ActiveConns, 1)
 
-	// 发送请求
-	t.queueSendUrgent(encrypted)
+	// ============ 关键修复：使用 sendDirect 保证顺序 ============
+	// 发送 Connect 请求
+	if err := t.sendDirect(encrypted); err != nil {
+		t.closeConn(reqID)
+		return nil, fmt.Errorf("发送 Connect 失败: %w", err)
+	}
 
 	t.log(logInfo, "连接请求: %s:%d (ID:%d, InitData:%d bytes)",
-		opts.Address, opts.Port, reqID, len(opts.InitData))
+		opts.Address, opts.Port, reqID, len(connectInitData))
+
+	// 如果有剩余数据，延迟发送（等待服务端建立连接）
+	if len(remainingData) > 0 {
+		go func() {
+			// 等待一小段时间，让服务端有机会处理 Connect 并建立到目标的连接
+			time.Sleep(50 * time.Millisecond)
+			
+			// 分片发送剩余数据
+			t.sendDataFragmented(reqID, remainingData)
+		}()
+	}
 
 	// 乐观模式：立即返回
 	if opts.Optimistic {
@@ -346,6 +385,37 @@ func (t *Tunnel) Connect(opts ConnectOptions) (io.ReadWriteCloser, error) {
 	case <-t.stopCh:
 		t.closeConn(reqID)
 		return nil, fmt.Errorf("隧道已关闭")
+	}
+}
+
+// sendDataFragmented 分片发送数据
+func (t *Tunnel) sendDataFragmented(reqID uint32, data []byte) {
+	maxPayload := t.GetMaxPayloadSize()
+	
+	for offset := 0; offset < len(data); offset += maxPayload {
+		end := offset + maxPayload
+		if end > len(data) {
+			end = len(data)
+		}
+
+		chunk := data[offset:end]
+		plain := protocol.BuildDataRequest(reqID, chunk)
+		
+		encrypted, err := t.crypto.Encrypt(plain)
+		if err != nil {
+			t.log(logDebug, "加密分片失败: %v", err)
+			continue
+		}
+
+		// 使用 sendDirect 保证顺序
+		if err := t.sendDirect(encrypted); err != nil {
+			t.log(logDebug, "发送分片失败: %v", err)
+		}
+
+		// 分片间短暂延迟
+		if end < len(data) {
+			time.Sleep(time.Millisecond)
+		}
 	}
 }
 
