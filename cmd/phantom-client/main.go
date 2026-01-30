@@ -1,5 +1,3 @@
-
-
 // cmd/phantom-client/main.go
 package main
 
@@ -19,7 +17,7 @@ import (
 )
 
 var (
-	Version   = "3.1.0"
+	Version   = "3.2.0"
 	BuildTime = "unknown"
 	GitCommit = "unknown"
 )
@@ -32,7 +30,7 @@ type Config struct {
 	LogLevel      string `yaml:"log_level"`
 	MTU           int    `yaml:"mtu"`
 	SkipTimeCheck bool   `yaml:"skip_time_check"`
-	Optimistic    bool   `yaml:"optimistic"` // 0-RTT 优化
+	Optimistic    bool   `yaml:"optimistic"`
 	SendWorkers   int    `yaml:"send_workers"`
 }
 
@@ -49,15 +47,16 @@ func main() {
 	flag.Parse()
 
 	if *showVersion {
-		fmt.Printf("Phantom Client v%s\n", Version)
+		fmt.Printf("Phantom Client v%s (ARQ)\n", Version)
 		fmt.Printf("  Build: %s\n", BuildTime)
 		fmt.Printf("  Commit: %s\n", GitCommit)
 		fmt.Printf("  推荐 MTU: %d\n", tunnel.RecommendedMTU)
 		fmt.Printf("  最大载荷: %d bytes\n", tunnel.MaxPayloadSize)
 		fmt.Println("\n特性:")
+		fmt.Println("  - ARQ 可靠传输: 自动重传、排序、去重")
 		fmt.Println("  - 0-RTT 优化: 减少 TLS 连接延迟")
-		fmt.Println("  - 无锁发送队列: 高并发吞吐优化")
 		fmt.Println("  - 自动分片: 大包自动处理")
+		fmt.Println("  - RTT 自适应: 动态调整超时时间")
 		return
 	}
 
@@ -73,7 +72,6 @@ func main() {
 		}
 	}
 
-	// 命令行参数覆盖
 	if *serverFlag != "" {
 		cfg.Server = *serverFlag
 	}
@@ -93,14 +91,12 @@ func main() {
 		cfg.Optimistic = false
 	}
 
-	// 验证必需参数
 	if cfg.Server == "" || cfg.PSK == "" {
 		fmt.Fprintf(os.Stderr, "错误: 必须指定服务器和 PSK\n")
 		fmt.Fprintf(os.Stderr, "用法: %s -s <server:port> -psk <base64_psk>\n", os.Args[0])
 		os.Exit(1)
 	}
 
-	// 时间同步检查
 	if !cfg.SkipTimeCheck {
 		fmt.Print("检查系统时间... ")
 		maxDrift := time.Duration(cfg.TimeWindow) * time.Second
@@ -116,12 +112,10 @@ func main() {
 		fmt.Println("✓")
 	}
 
-	// MTU 警告
 	if cfg.MTU > 1400 {
 		fmt.Printf("警告: MTU=%d 较大，建议 %d\n", cfg.MTU, tunnel.RecommendedMTU)
 	}
 
-	// 创建隧道
 	tun, err := tunnel.New(tunnel.Config{
 		ServerAddr:  cfg.Server,
 		PSK:         cfg.PSK,
@@ -140,7 +134,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	// 创建 SOCKS5 服务器
 	socks := socks5.New(socks5.Config{
 		Addr:       cfg.Socks5,
 		Tunnel:     tun,
@@ -154,7 +147,6 @@ func main() {
 
 	printBanner(cfg, tun)
 
-	// 等待信号
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -170,7 +162,6 @@ func main() {
 	socks.Stop()
 	tun.Stop()
 
-	// 输出统计
 	if *showStats {
 		printStats(tun)
 	}
@@ -206,15 +197,15 @@ func printBanner(cfg *Config, tun *tunnel.Tunnel) {
 
 	fmt.Println()
 	fmt.Println("╔══════════════════════════════════════════════════════════╗")
-	fmt.Println("║            Phantom Client v3.1                           ║")
-	fmt.Println("║            极简 · 无状态 · 抗探测                        ║")
+	fmt.Println("║            Phantom Client v3.2 (ARQ)                     ║")
+	fmt.Println("║            极简 · 可靠传输 · 抗探测                      ║")
 	fmt.Println("╠══════════════════════════════════════════════════════════╣")
 	fmt.Printf("║  服务器: %-47s ║\n", cfg.Server)
 	fmt.Printf("║  SOCKS5: %-47s ║\n", cfg.Socks5)
 	fmt.Printf("║  MTU: %-50d ║\n", cfg.MTU)
 	fmt.Printf("║  0-RTT: %-48s ║\n", optimisticStr)
-	fmt.Printf("║  发送协程: %-45d ║\n", cfg.SendWorkers)
 	fmt.Println("╠══════════════════════════════════════════════════════════╣")
+	fmt.Println("║  特性: ARQ可靠传输 | 自动重传 | RTT自适应                ║")
 	fmt.Println("║  按 Ctrl+C 停止  |  --stats 查看统计                     ║")
 	fmt.Println("╚══════════════════════════════════════════════════════════╝")
 	fmt.Println()
@@ -230,6 +221,7 @@ func printStats(tun *tunnel.Tunnel) {
 	fmt.Printf("  接收字节: %s\n", formatBytes(stats.BytesRecv))
 	fmt.Printf("  连接请求: %d\n", stats.ConnectRequests)
 	fmt.Printf("  分片包数: %d\n", stats.FragmentedPackets)
+	fmt.Printf("  ARQ重传: %d\n", stats.ARQRetrans)
 	fmt.Printf("  队列丢弃: %d\n", stats.QueueFullDrops)
 	fmt.Println("═══════════════════════════════════════════════")
 }
@@ -246,5 +238,3 @@ func formatBytes(b uint64) string {
 	}
 	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGTPE"[exp])
 }
-
-
