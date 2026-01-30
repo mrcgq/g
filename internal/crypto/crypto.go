@@ -1,3 +1,4 @@
+// internal/crypto/crypto.go
 package crypto
 
 import (
@@ -24,15 +25,19 @@ const (
 	HeaderSize    = UserIDSize + TimestampSize // 6
 )
 
-// Crypto 加密器 (客户端版本)
+// Crypto 加密器
 type Crypto struct {
 	psk        []byte
 	userID     [UserIDSize]byte
 	timeWindow int
 
-	aeadCache   sync.Map // window -> cipher.AEAD
-	replayCache sync.Map // nonce -> time.Time
-	mu          sync.RWMutex
+	aeadCache sync.Map // window -> cipher.AEAD
+
+	// 改进：分离接收和发送的 Nonce 缓存
+	recvNonceCache sync.Map // 接收到的 nonce -> time.Time
+	sendNonceCache sync.Map // 发送过的 nonce -> time.Time
+
+	mu sync.RWMutex
 }
 
 // New 创建加密器
@@ -50,13 +55,13 @@ func New(pskBase64 string, timeWindow int) (*Crypto, error) {
 		timeWindow: timeWindow,
 	}
 
-	// 派生 UserID (与服务端完全一致)
+	// 派生 UserID
 	reader := hkdf.New(sha256.New, psk, nil, []byte("phantom-userid-v3"))
 	if _, err := io.ReadFull(reader, c.userID[:]); err != nil {
 		return nil, fmt.Errorf("派生 UserID 失败: %w", err)
 	}
 
-	// 启动清理协程
+	// 启动清理
 	go c.cleanupLoop()
 
 	return c, nil
@@ -68,7 +73,6 @@ func (c *Crypto) GetUserID() [UserIDSize]byte {
 }
 
 // Encrypt 加密数据
-// 输出格式: UserID(4) + Timestamp(2) + Nonce(12) + Ciphertext + Tag(16)
 func (c *Crypto) Encrypt(plaintext []byte) ([]byte, error) {
 	window := c.currentWindow()
 	aead, err := c.getAEAD(window)
@@ -76,22 +80,32 @@ func (c *Crypto) Encrypt(plaintext []byte) ([]byte, error) {
 		return nil, err
 	}
 
-	// 生成随机 Nonce
+	// 生成唯一 Nonce
 	nonce := make([]byte, NonceSize)
-	if _, err := rand.Read(nonce); err != nil {
-		return nil, fmt.Errorf("生成 Nonce 失败: %w", err)
+	for attempts := 0; attempts < 10; attempts++ {
+		if _, err := rand.Read(nonce); err != nil {
+			return nil, err
+		}
+		
+		// 确保这个 nonce 没有被发送过
+		nonceKey := string(nonce)
+		if _, exists := c.sendNonceCache.LoadOrStore(nonceKey, time.Now()); !exists {
+			break // 找到了唯一的 nonce
+		}
+		if attempts == 9 {
+			return nil, fmt.Errorf("无法生成唯一 Nonce")
+		}
 	}
 
-	// 时间戳 (低16位)
 	timestamp := uint16(time.Now().Unix() & 0xFFFF)
 
-	// 构建输出
+	// 输出: UserID(4) + Timestamp(2) + Nonce(12) + Ciphertext + Tag(16)
 	output := make([]byte, HeaderSize+NonceSize+len(plaintext)+TagSize)
 	copy(output[:UserIDSize], c.userID[:])
 	binary.BigEndian.PutUint16(output[UserIDSize:HeaderSize], timestamp)
 	copy(output[HeaderSize:HeaderSize+NonceSize], nonce)
 
-	// AAD = Header, AEAD 加密
+	// AAD = Header, Seal 会追加密文到 dst
 	aead.Seal(output[HeaderSize+NonceSize:HeaderSize+NonceSize], nonce, plaintext, output[:HeaderSize])
 
 	return output, nil
@@ -101,7 +115,7 @@ func (c *Crypto) Encrypt(plaintext []byte) ([]byte, error) {
 func (c *Crypto) Decrypt(data []byte) ([]byte, error) {
 	minSize := HeaderSize + NonceSize + TagSize
 	if len(data) < minSize {
-		return nil, fmt.Errorf("数据太短: %d < %d", len(data), minSize)
+		return nil, fmt.Errorf("数据太短")
 	}
 
 	// 验证 UserID
@@ -117,23 +131,26 @@ func (c *Crypto) Decrypt(data []byte) ([]byte, error) {
 		return nil, fmt.Errorf("时间戳无效")
 	}
 
-	// 重放检查
 	nonce := data[HeaderSize : HeaderSize+NonceSize]
 	nonceKey := string(nonce)
-	if _, exists := c.replayCache.LoadOrStore(nonceKey, time.Now()); exists {
-		return nil, fmt.Errorf("重放攻击检测")
+
+	// 重放检查：只检查接收缓存
+	if _, exists := c.recvNonceCache.Load(nonceKey); exists {
+		return nil, fmt.Errorf("重放攻击")
 	}
 
 	ciphertext := data[HeaderSize+NonceSize:]
 	header := data[:HeaderSize]
 
-	// 尝试多个时间窗口解密
+	// 尝试多个时间窗口
 	for _, window := range c.validWindows() {
 		aead, err := c.getAEAD(window)
 		if err != nil {
 			continue
 		}
 		if plaintext, err := aead.Open(nil, nonce, ciphertext, header); err == nil {
+			// 解密成功后才记录 nonce
+			c.recvNonceCache.Store(nonceKey, time.Now())
 			return plaintext, nil
 		}
 	}
@@ -141,24 +158,21 @@ func (c *Crypto) Decrypt(data []byte) ([]byte, error) {
 	return nil, fmt.Errorf("解密失败")
 }
 
-// currentWindow 当前时间窗口
 func (c *Crypto) currentWindow() int64 {
 	return time.Now().Unix() / int64(c.timeWindow)
 }
 
-// validWindows 有效的时间窗口 (前后各一个)
 func (c *Crypto) validWindows() []int64 {
 	w := c.currentWindow()
 	return []int64{w - 1, w, w + 1}
 }
 
-// getAEAD 获取或创建 AEAD 实例
 func (c *Crypto) getAEAD(window int64) (cipher.AEAD, error) {
 	if v, ok := c.aeadCache.Load(window); ok {
 		return v.(cipher.AEAD), nil
 	}
 
-	// 派生会话密钥
+	// 派生密钥
 	salt := make([]byte, 8)
 	binary.BigEndian.PutUint64(salt, uint64(window))
 	reader := hkdf.New(sha256.New, c.psk, salt, []byte("phantom-key-v3"))
@@ -171,12 +185,10 @@ func (c *Crypto) getAEAD(window int64) (cipher.AEAD, error) {
 	if err != nil {
 		return nil, fmt.Errorf("创建 AEAD 失败: %w", err)
 	}
-
 	c.aeadCache.Store(window, aead)
 	return aead, nil
 }
 
-// validateTimestamp 验证时间戳
 func (c *Crypto) validateTimestamp(ts uint16) bool {
 	current := uint16(time.Now().Unix() & 0xFFFF)
 	diff := int(current) - int(ts)
@@ -194,7 +206,6 @@ func (c *Crypto) validateTimestamp(ts uint16) bool {
 	return diff <= c.timeWindow*2
 }
 
-// cleanupLoop 清理过期缓存
 func (c *Crypto) cleanupLoop() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
@@ -202,11 +213,20 @@ func (c *Crypto) cleanupLoop() {
 	for range ticker.C {
 		now := time.Now()
 		cw := c.currentWindow()
+		expireTime := 2 * time.Minute
 
-		// 清理重放缓存
-		c.replayCache.Range(func(key, value interface{}) bool {
-			if t, ok := value.(time.Time); ok && now.Sub(t) > 2*time.Minute {
-				c.replayCache.Delete(key)
+		// 清理接收 nonce 缓存
+		c.recvNonceCache.Range(func(key, value interface{}) bool {
+			if t, ok := value.(time.Time); ok && now.Sub(t) > expireTime {
+				c.recvNonceCache.Delete(key)
+			}
+			return true
+		})
+
+		// 清理发送 nonce 缓存
+		c.sendNonceCache.Range(func(key, value interface{}) bool {
+			if t, ok := value.(time.Time); ok && now.Sub(t) > expireTime {
+				c.sendNonceCache.Delete(key)
 			}
 			return true
 		})
@@ -219,4 +239,13 @@ func (c *Crypto) cleanupLoop() {
 			return true
 		})
 	}
+}
+
+// GeneratePSK 生成新的 PSK
+func GeneratePSK() (string, error) {
+	psk := make([]byte, PSKSize)
+	if _, err := rand.Read(psk); err != nil {
+		return "", err
+	}
+	return base64.StdEncoding.EncodeToString(psk), nil
 }
