@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/anthropics/phantom-client/internal/arq"
 	"github.com/anthropics/phantom-client/internal/crypto"
 	"github.com/anthropics/phantom-client/internal/protocol"
 )
@@ -19,40 +20,24 @@ import (
 // ============================================================================
 
 const (
-	// MTU 相关
 	DefaultMTU       = 1500
 	IPUDPHeaderSize  = 28
 	CryptoOverhead   = 34
+	ARQOverhead      = 11 // ARQ Header: Seq(4) + Ack(4) + Flags(1) + Len(2)
 	ProtocolOverhead = 5
 	SafeMargin       = 100
-	
-	// Connect 请求中 InitData 的最大安全大小
-	// Connect 包结构: Type(1) + ReqID(4) + Network(1) + AddrType(1) + Addr(max 257) + Port(2) + InitData
-	// 安全大小 = MTU - IP/UDP - Crypto - Protocol - Addr = 1500 - 28 - 34 - 270 ≈ 1168
-	// 保守值设为 800，确保不会超限
-	MaxConnectInitData = 800
-	
-	MaxPayloadSize   = DefaultMTU - IPUDPHeaderSize - CryptoOverhead - ProtocolOverhead - SafeMargin
-	RecommendedMTU   = 1300
 
-	// 发送队列
+	MaxConnectInitData = 800
+	MaxPayloadSize     = DefaultMTU - IPUDPHeaderSize - CryptoOverhead - ARQOverhead - ProtocolOverhead - SafeMargin
+	RecommendedMTU     = 1300
+
 	SendQueueSize   = 4096
 	SendWorkerCount = 4
 
-	// 日志级别
 	logError = 0
 	logInfo  = 1
 	logDebug = 2
 )
-
-// ============================================================================
-// 发送任务
-// ============================================================================
-
-type sendTask struct {
-	data     []byte
-	priority bool // 高优先级（Connect 包）
-}
 
 // ============================================================================
 // Tunnel 主结构
@@ -66,10 +51,12 @@ type Tunnel struct {
 	mtu        int
 
 	reqIDCounter uint32
-	pending      sync.Map
+	pending      sync.Map // reqID -> *PendingConn
 
-	sendQueue chan sendTask
-	sendWg    sync.WaitGroup
+	// 全局 ARQ 连接（与服务端通信）
+	arqConn   *arq.Conn
+	arqMu     sync.RWMutex
+	arqClosed bool
 
 	stopCh chan struct{}
 	wg     sync.WaitGroup
@@ -87,6 +74,7 @@ type Stats struct {
 	QueueFullDrops    uint64
 	ConnectRequests   uint64
 	ActiveConns       int64
+	ARQRetrans        uint64
 }
 
 // PendingConn 等待中的连接
@@ -103,7 +91,6 @@ type PendingConn struct {
 // 配置
 // ============================================================================
 
-// Config 隧道配置
 type Config struct {
 	ServerAddr  string
 	PSK         string
@@ -113,7 +100,6 @@ type Config struct {
 	SendWorkers int
 }
 
-// ConnectOptions 连接选项
 type ConnectOptions struct {
 	Network    string
 	Address    string
@@ -127,7 +113,6 @@ type ConnectOptions struct {
 // 构造函数
 // ============================================================================
 
-// New 创建隧道
 func New(cfg Config) (*Tunnel, error) {
 	addr, err := net.ResolveUDPAddr("udp", cfg.ServerAddr)
 	if err != nil {
@@ -157,14 +142,12 @@ func New(cfg Config) (*Tunnel, error) {
 		crypto:     cry,
 		logLevel:   level,
 		mtu:        mtu,
-		sendQueue:  make(chan sendTask, SendQueueSize),
 		stopCh:     make(chan struct{}),
 	}
 
 	return t, nil
 }
 
-// NewSimple 简化构造（兼容旧接口）
 func NewSimple(serverAddr, psk string, timeWindow int, logLevel string) (*Tunnel, error) {
 	return New(Config{
 		ServerAddr: serverAddr,
@@ -178,7 +161,6 @@ func NewSimple(serverAddr, psk string, timeWindow int, logLevel string) (*Tunnel
 // 生命周期
 // ============================================================================
 
-// Start 启动隧道
 func (t *Tunnel) Start() error {
 	conn, err := net.DialUDP("udp", nil, t.serverAddr)
 	if err != nil {
@@ -189,39 +171,52 @@ func (t *Tunnel) Start() error {
 	_ = conn.SetReadBuffer(4 * 1024 * 1024)
 	_ = conn.SetWriteBuffer(4 * 1024 * 1024)
 
+	// 创建 ARQ 连接
+	t.arqConn = arq.New(func(data []byte) error {
+		// ARQ 数据 -> 加密 -> UDP 发送
+		encrypted, err := t.crypto.Encrypt(data)
+		if err != nil {
+			return err
+		}
+		_, err = t.conn.Write(encrypted)
+		if err == nil {
+			atomic.AddUint64(&t.stats.PacketsSent, 1)
+			atomic.AddUint64(&t.stats.BytesSent, uint64(len(encrypted)))
+		}
+		return err
+	})
+
 	// 启动接收协程
 	t.wg.Add(1)
 	go t.recvLoop()
 
-	// 启动发送协程池
-	workerCount := runtime.NumCPU()
-	if workerCount > SendWorkerCount {
-		workerCount = SendWorkerCount
-	}
-	if workerCount < 2 {
-		workerCount = 2
-	}
-	for i := 0; i < workerCount; i++ {
-		t.sendWg.Add(1)
-		go t.sendWorker()
-	}
+	// 启动 ARQ 数据分发协程
+	t.wg.Add(1)
+	go t.arqDispatchLoop()
 
 	// 启动清理协程
 	t.wg.Add(1)
 	go t.cleanupLoop()
 
-	t.log(logInfo, "隧道已启动, 服务器: %s, MTU: %d, 发送协程: %d",
-		t.serverAddr, t.mtu, workerCount)
+	workerCount := runtime.NumCPU()
+	if workerCount > SendWorkerCount {
+		workerCount = SendWorkerCount
+	}
+
+	t.log(logInfo, "隧道已启动 (ARQ模式), 服务器: %s, MTU: %d", t.serverAddr, t.mtu)
 
 	return nil
 }
 
-// Stop 停止隧道
 func (t *Tunnel) Stop() {
 	close(t.stopCh)
 
-	close(t.sendQueue)
-	t.sendWg.Wait()
+	t.arqMu.Lock()
+	t.arqClosed = true
+	if t.arqConn != nil {
+		t.arqConn.Close()
+	}
+	t.arqMu.Unlock()
 
 	if t.conn != nil {
 		t.conn.Close()
@@ -229,212 +224,6 @@ func (t *Tunnel) Stop() {
 	t.wg.Wait()
 
 	t.log(logInfo, "隧道已停止")
-}
-
-// ============================================================================
-// 发送工作协程
-// ============================================================================
-
-func (t *Tunnel) sendWorker() {
-	defer t.sendWg.Done()
-
-	for task := range t.sendQueue {
-		if task.data == nil {
-			continue
-		}
-
-		_, err := t.conn.Write(task.data)
-		if err != nil {
-			t.log(logDebug, "发送失败: %v", err)
-		} else {
-			atomic.AddUint64(&t.stats.PacketsSent, 1)
-			atomic.AddUint64(&t.stats.BytesSent, uint64(len(task.data)))
-		}
-	}
-}
-
-func (t *Tunnel) queueSend(data []byte) bool {
-	select {
-	case t.sendQueue <- sendTask{data: data}:
-		return true
-	default:
-		atomic.AddUint64(&t.stats.QueueFullDrops, 1)
-		t.log(logDebug, "发送队列满，丢弃包")
-		return false
-	}
-}
-
-func (t *Tunnel) queueSendUrgent(data []byte) {
-	select {
-	case t.sendQueue <- sendTask{data: data, priority: true}:
-	case <-t.stopCh:
-	}
-}
-
-// sendDirect 直接发送（用于需要保证顺序的场景）
-func (t *Tunnel) sendDirect(data []byte) error {
-	_, err := t.conn.Write(data)
-	if err == nil {
-		atomic.AddUint64(&t.stats.PacketsSent, 1)
-		atomic.AddUint64(&t.stats.BytesSent, uint64(len(data)))
-	}
-	return err
-}
-
-// ============================================================================
-// 连接管理
-// ============================================================================
-
-// Connect 建立连接
-func (t *Tunnel) Connect(opts ConnectOptions) (io.ReadWriteCloser, error) {
-	if opts.Timeout == 0 {
-		opts.Timeout = 10 * time.Second
-	}
-
-	reqID := atomic.AddUint32(&t.reqIDCounter, 1)
-	atomic.AddUint64(&t.stats.ConnectRequests, 1)
-
-	var netByte byte = protocol.NetworkTCP
-	if opts.Network == "udp" {
-		netByte = protocol.NetworkUDP
-	}
-
-	// ============ 关键修复：限制 Connect 包中的 InitData 大小 ============
-	var connectInitData []byte
-	var remainingData []byte
-	
-	if len(opts.InitData) > MaxConnectInitData {
-		// InitData 太大，分割处理
-		connectInitData = opts.InitData[:MaxConnectInitData]
-		remainingData = opts.InitData[MaxConnectInitData:]
-		t.log(logDebug, "InitData 分割: %d -> %d + %d", 
-			len(opts.InitData), len(connectInitData), len(remainingData))
-	} else {
-		connectInitData = opts.InitData
-	}
-
-	// 构建连接请求（只包含安全大小的 InitData）
-	plain, err := protocol.BuildConnectRequest(reqID, netByte, opts.Address, opts.Port, connectInitData)
-	if err != nil {
-		return nil, fmt.Errorf("构建请求失败: %w", err)
-	}
-
-	// 加密
-	encrypted, err := t.crypto.Encrypt(plain)
-	if err != nil {
-		return nil, fmt.Errorf("加密失败: %w", err)
-	}
-
-	// 创建等待通道
-	pc := &PendingConn{
-		ReqID:    reqID,
-		DataCh:   make(chan []byte, 256),
-		DoneCh:   make(chan struct{}),
-		LastSeen: time.Now(),
-	}
-	t.pending.Store(reqID, pc)
-	atomic.AddInt64(&t.stats.ActiveConns, 1)
-
-	// ============ 关键修复：使用 sendDirect 保证顺序 ============
-	// 发送 Connect 请求
-	if err := t.sendDirect(encrypted); err != nil {
-		t.closeConn(reqID)
-		return nil, fmt.Errorf("发送 Connect 失败: %w", err)
-	}
-
-	t.log(logInfo, "连接请求: %s:%d (ID:%d, InitData:%d bytes)",
-		opts.Address, opts.Port, reqID, len(connectInitData))
-
-	// 如果有剩余数据，延迟发送（等待服务端建立连接）
-	if len(remainingData) > 0 {
-		go func() {
-			// 等待一小段时间，让服务端有机会处理 Connect 并建立到目标的连接
-			time.Sleep(50 * time.Millisecond)
-			
-			// 分片发送剩余数据
-			t.sendDataFragmented(reqID, remainingData)
-		}()
-	}
-
-	// 乐观模式：立即返回
-	if opts.Optimistic {
-		pc.Connected.Store(true)
-		return &TunnelConn{tunnel: t, pc: pc}, nil
-	}
-
-	// 等待服务端确认
-	select {
-	case data := <-pc.DataCh:
-		resp, err := protocol.ParseResponse(data)
-		if err != nil {
-			t.closeConn(reqID)
-			return nil, fmt.Errorf("解析响应失败: %w", err)
-		}
-		if resp.Status != protocol.StatusSuccess {
-			t.closeConn(reqID)
-			return nil, fmt.Errorf("服务端拒绝连接 (status: 0x%02x)", resp.Status)
-		}
-		pc.Connected.Store(true)
-		t.log(logDebug, "连接成功: ID:%d", reqID)
-		return &TunnelConn{tunnel: t, pc: pc}, nil
-
-	case <-time.After(opts.Timeout):
-		t.closeConn(reqID)
-		return nil, fmt.Errorf("连接超时")
-
-	case <-t.stopCh:
-		t.closeConn(reqID)
-		return nil, fmt.Errorf("隧道已关闭")
-	}
-}
-
-// sendDataFragmented 分片发送数据
-func (t *Tunnel) sendDataFragmented(reqID uint32, data []byte) {
-	maxPayload := t.GetMaxPayloadSize()
-	
-	for offset := 0; offset < len(data); offset += maxPayload {
-		end := offset + maxPayload
-		if end > len(data) {
-			end = len(data)
-		}
-
-		chunk := data[offset:end]
-		plain := protocol.BuildDataRequest(reqID, chunk)
-		
-		encrypted, err := t.crypto.Encrypt(plain)
-		if err != nil {
-			t.log(logDebug, "加密分片失败: %v", err)
-			continue
-		}
-
-		// 使用 sendDirect 保证顺序
-		if err := t.sendDirect(encrypted); err != nil {
-			t.log(logDebug, "发送分片失败: %v", err)
-		}
-
-		// 分片间短暂延迟
-		if end < len(data) {
-			time.Sleep(time.Millisecond)
-		}
-	}
-}
-
-// ConnectSimple 简化的连接方法（兼容旧接口）
-func (t *Tunnel) ConnectSimple(network, address string, port uint16, initData []byte) (io.ReadWriteCloser, error) {
-	return t.Connect(ConnectOptions{
-		Network:  network,
-		Address:  address,
-		Port:     port,
-		InitData: initData,
-	})
-}
-
-func (t *Tunnel) closeConn(reqID uint32) {
-	if v, ok := t.pending.LoadAndDelete(reqID); ok {
-		pc := v.(*PendingConn)
-		close(pc.DoneCh)
-		atomic.AddInt64(&t.stats.ActiveConns, -1)
-	}
 }
 
 // ============================================================================
@@ -482,8 +271,49 @@ func (t *Tunnel) recvLoop() {
 			continue
 		}
 
-		// 解析响应
-		resp, err := protocol.ParseResponse(plaintext)
+		// 交给 ARQ 处理
+		t.arqMu.RLock()
+		arqConn := t.arqConn
+		closed := t.arqClosed
+		t.arqMu.RUnlock()
+
+		if !closed && arqConn != nil {
+			if err := arqConn.OnReceive(plaintext); err != nil {
+				t.log(logDebug, "ARQ 处理失败: %v", err)
+			}
+		}
+	}
+}
+
+// arqDispatchLoop 从 ARQ 接收数据并分发到对应连接
+func (t *Tunnel) arqDispatchLoop() {
+	defer t.wg.Done()
+
+	for {
+		t.arqMu.RLock()
+		arqConn := t.arqConn
+		closed := t.arqClosed
+		t.arqMu.RUnlock()
+
+		if closed || arqConn == nil {
+			return
+		}
+
+		// 从 ARQ 接收数据
+		data, err := arqConn.RecvTimeout(time.Second)
+		if err != nil {
+			if err == arq.ErrTimeout {
+				continue
+			}
+			if err == arq.ErrClosed {
+				return
+			}
+			t.log(logDebug, "ARQ 接收错误: %v", err)
+			continue
+		}
+
+		// 解析协议响应
+		resp, err := protocol.ParseResponse(data)
 		if err != nil {
 			t.log(logDebug, "解析响应失败: %v", err)
 			continue
@@ -497,11 +327,164 @@ func (t *Tunnel) recvLoop() {
 			pc.mu.Unlock()
 
 			select {
-			case pc.DataCh <- plaintext:
+			case pc.DataCh <- data:
 			default:
 				t.log(logDebug, "数据通道满, 丢弃: ID:%d", resp.ReqID)
 			}
 		}
+	}
+}
+
+// ============================================================================
+// 连接管理
+// ============================================================================
+
+func (t *Tunnel) Connect(opts ConnectOptions) (io.ReadWriteCloser, error) {
+	if opts.Timeout == 0 {
+		opts.Timeout = 10 * time.Second
+	}
+
+	reqID := atomic.AddUint32(&t.reqIDCounter, 1)
+	atomic.AddUint64(&t.stats.ConnectRequests, 1)
+
+	var netByte byte = protocol.NetworkTCP
+	if opts.Network == "udp" {
+		netByte = protocol.NetworkUDP
+	}
+
+	// 限制 Connect 包中的 InitData 大小
+	var connectInitData []byte
+	var remainingData []byte
+
+	if len(opts.InitData) > MaxConnectInitData {
+		connectInitData = opts.InitData[:MaxConnectInitData]
+		remainingData = opts.InitData[MaxConnectInitData:]
+		t.log(logDebug, "InitData 分割: %d -> %d + %d",
+			len(opts.InitData), len(connectInitData), len(remainingData))
+	} else {
+		connectInitData = opts.InitData
+	}
+
+	// 构建连接请求
+	plain, err := protocol.BuildConnectRequest(reqID, netByte, opts.Address, opts.Port, connectInitData)
+	if err != nil {
+		return nil, fmt.Errorf("构建请求失败: %w", err)
+	}
+
+	// 创建等待通道
+	pc := &PendingConn{
+		ReqID:    reqID,
+		DataCh:   make(chan []byte, 256),
+		DoneCh:   make(chan struct{}),
+		LastSeen: time.Now(),
+	}
+	t.pending.Store(reqID, pc)
+	atomic.AddInt64(&t.stats.ActiveConns, 1)
+
+	// 通过 ARQ 发送
+	t.arqMu.RLock()
+	arqConn := t.arqConn
+	t.arqMu.RUnlock()
+
+	if arqConn == nil {
+		t.closeConn(reqID)
+		return nil, fmt.Errorf("ARQ 连接未初始化")
+	}
+
+	if err := arqConn.Send(plain); err != nil {
+		t.closeConn(reqID)
+		return nil, fmt.Errorf("发送 Connect 失败: %w", err)
+	}
+
+	t.log(logInfo, "连接请求: %s:%d (ID:%d, InitData:%d bytes)",
+		opts.Address, opts.Port, reqID, len(connectInitData))
+
+	// 如果有剩余数据，延迟发送
+	if len(remainingData) > 0 {
+		go func() {
+			time.Sleep(50 * time.Millisecond)
+			t.sendDataFragmented(reqID, remainingData)
+		}()
+	}
+
+	// 乐观模式
+	if opts.Optimistic {
+		pc.Connected.Store(true)
+		return &TunnelConn{tunnel: t, pc: pc}, nil
+	}
+
+	// 等待服务端确认
+	select {
+	case data := <-pc.DataCh:
+		resp, err := protocol.ParseResponse(data)
+		if err != nil {
+			t.closeConn(reqID)
+			return nil, fmt.Errorf("解析响应失败: %w", err)
+		}
+		if resp.Status != protocol.StatusSuccess {
+			t.closeConn(reqID)
+			return nil, fmt.Errorf("服务端拒绝连接 (status: 0x%02x)", resp.Status)
+		}
+		pc.Connected.Store(true)
+		t.log(logDebug, "连接成功: ID:%d", reqID)
+		return &TunnelConn{tunnel: t, pc: pc}, nil
+
+	case <-time.After(opts.Timeout):
+		t.closeConn(reqID)
+		return nil, fmt.Errorf("连接超时")
+
+	case <-t.stopCh:
+		t.closeConn(reqID)
+		return nil, fmt.Errorf("隧道已关闭")
+	}
+}
+
+// sendDataFragmented 分片发送数据
+func (t *Tunnel) sendDataFragmented(reqID uint32, data []byte) {
+	maxPayload := t.GetMaxPayloadSize()
+
+	t.arqMu.RLock()
+	arqConn := t.arqConn
+	t.arqMu.RUnlock()
+
+	if arqConn == nil {
+		return
+	}
+
+	for offset := 0; offset < len(data); offset += maxPayload {
+		end := offset + maxPayload
+		if end > len(data) {
+			end = len(data)
+		}
+
+		chunk := data[offset:end]
+		plain := protocol.BuildDataRequest(reqID, chunk)
+
+		if err := arqConn.Send(plain); err != nil {
+			t.log(logDebug, "发送分片失败: %v", err)
+			return
+		}
+
+		if end < len(data) {
+			time.Sleep(time.Millisecond)
+		}
+	}
+}
+
+func (t *Tunnel) ConnectSimple(network, address string, port uint16, initData []byte) (io.ReadWriteCloser, error) {
+	return t.Connect(ConnectOptions{
+		Network:  network,
+		Address:  address,
+		Port:     port,
+		InitData: initData,
+	})
+}
+
+func (t *Tunnel) closeConn(reqID uint32) {
+	if v, ok := t.pending.LoadAndDelete(reqID); ok {
+		pc := v.(*PendingConn)
+		close(pc.DoneCh)
+		atomic.AddInt64(&t.stats.ActiveConns, -1)
 	}
 }
 
@@ -532,6 +515,14 @@ func (t *Tunnel) cleanupLoop() {
 				}
 				return true
 			})
+
+			// 更新 ARQ 统计
+			t.arqMu.RLock()
+			if t.arqConn != nil {
+				arqStats := t.arqConn.GetStats()
+				atomic.StoreUint64(&t.stats.ARQRetrans, arqStats.PacketsRetrans)
+			}
+			t.arqMu.RUnlock()
 		}
 	}
 }
@@ -540,12 +531,10 @@ func (t *Tunnel) cleanupLoop() {
 // 工具方法
 // ============================================================================
 
-// GetMaxPayloadSize 获取最大载荷大小
 func (t *Tunnel) GetMaxPayloadSize() int {
-	return t.mtu - IPUDPHeaderSize - CryptoOverhead - ProtocolOverhead
+	return t.mtu - IPUDPHeaderSize - CryptoOverhead - ARQOverhead - ProtocolOverhead
 }
 
-// GetStats 获取统计信息
 func (t *Tunnel) GetStats() Stats {
 	return Stats{
 		PacketsSent:       atomic.LoadUint64(&t.stats.PacketsSent),
@@ -556,6 +545,7 @@ func (t *Tunnel) GetStats() Stats {
 		QueueFullDrops:    atomic.LoadUint64(&t.stats.QueueFullDrops),
 		ConnectRequests:   atomic.LoadUint64(&t.stats.ConnectRequests),
 		ActiveConns:       atomic.LoadInt64(&t.stats.ActiveConns),
+		ARQRetrans:        atomic.LoadUint64(&t.stats.ARQRetrans),
 	}
 }
 
@@ -571,14 +561,12 @@ func (t *Tunnel) log(level int, format string, args ...interface{}) {
 // TunnelConn - 隧道连接
 // ============================================================================
 
-// TunnelConn 隧道连接
 type TunnelConn struct {
 	tunnel *Tunnel
 	pc     *PendingConn
 	closed atomic.Bool
 }
 
-// Read 读取数据
 func (c *TunnelConn) Read(p []byte) (n int, err error) {
 	for {
 		select {
@@ -588,7 +576,6 @@ func (c *TunnelConn) Read(p []byte) (n int, err error) {
 				return 0, err
 			}
 
-			// 检查状态
 			if !c.pc.Connected.Load() {
 				if resp.Status == protocol.StatusSuccess {
 					c.pc.Connected.Store(true)
@@ -615,7 +602,6 @@ func (c *TunnelConn) Read(p []byte) (n int, err error) {
 	}
 }
 
-// Write 写入数据
 func (c *TunnelConn) Write(p []byte) (n int, err error) {
 	if c.closed.Load() {
 		return 0, io.ErrClosedPipe
@@ -633,13 +619,16 @@ func (c *TunnelConn) Write(p []byte) (n int, err error) {
 func (c *TunnelConn) writeSingle(p []byte) (int, error) {
 	plain := protocol.BuildDataRequest(c.pc.ReqID, p)
 
-	encrypted, err := c.tunnel.crypto.Encrypt(plain)
-	if err != nil {
-		return 0, err
+	c.tunnel.arqMu.RLock()
+	arqConn := c.tunnel.arqConn
+	c.tunnel.arqMu.RUnlock()
+
+	if arqConn == nil {
+		return 0, fmt.Errorf("ARQ 连接已关闭")
 	}
 
-	if !c.tunnel.queueSend(encrypted) {
-		return 0, fmt.Errorf("发送队列满")
+	if err := arqConn.Send(plain); err != nil {
+		return 0, err
 	}
 
 	c.pc.mu.Lock()
@@ -672,16 +661,19 @@ func (c *TunnelConn) writeFragmented(p []byte, maxPayload int) (int, error) {
 	return totalSent, nil
 }
 
-// Close 关闭连接
 func (c *TunnelConn) Close() error {
 	if c.closed.Swap(true) {
 		return nil
 	}
 
 	plain := protocol.BuildCloseRequest(c.pc.ReqID)
-	encrypted, err := c.tunnel.crypto.Encrypt(plain)
-	if err == nil {
-		c.tunnel.queueSend(encrypted)
+
+	c.tunnel.arqMu.RLock()
+	arqConn := c.tunnel.arqConn
+	c.tunnel.arqMu.RUnlock()
+
+	if arqConn != nil {
+		_ = arqConn.Send(plain)
 	}
 
 	c.tunnel.closeConn(c.pc.ReqID)
