@@ -1,6 +1,4 @@
-
-
-
+// internal/tunnel/tunnel.go
 package tunnel
 
 import (
@@ -31,8 +29,8 @@ const (
 	RecommendedMTU   = 1300
 
 	// 发送队列
-	SendQueueSize    = 4096
-	SendWorkerCount  = 4
+	SendQueueSize   = 4096
+	SendWorkerCount = 4
 
 	// 日志级别
 	logError = 0
@@ -46,7 +44,7 @@ const (
 
 type sendTask struct {
 	data []byte
-	addr *net.UDPAddr // nil 表示使用默认连接
+	addr *net.UDPAddr
 }
 
 // ============================================================================
@@ -60,24 +58,19 @@ type Tunnel struct {
 	logLevel   int
 	mtu        int
 
-	// 请求 ID 生成器
 	reqIDCounter uint32
+	pending      sync.Map
 
-	// 连接映射
-	pending sync.Map // reqID -> *PendingConn
-
-	// 发送队列 (优化点2)
 	sendQueue chan sendTask
 	sendWg    sync.WaitGroup
 
-	// 生命周期
 	stopCh chan struct{}
 	wg     sync.WaitGroup
 
-	// 统计
 	stats Stats
 }
 
+// Stats 统计信息
 type Stats struct {
 	PacketsSent       uint64
 	PacketsRecv       uint64
@@ -89,32 +82,45 @@ type Stats struct {
 	ActiveConns       int64
 }
 
+// PendingConn 等待中的连接
 type PendingConn struct {
-	ReqID      uint32
-	DataCh     chan []byte
-	DoneCh     chan struct{}
-	LastSeen   time.Time
-	Connected  atomic.Bool  // 是否已连接成功
-	mu         sync.RWMutex
+	ReqID     uint32
+	DataCh    chan []byte
+	DoneCh    chan struct{}
+	LastSeen  time.Time
+	Connected atomic.Bool
+	mu        sync.RWMutex
 }
 
 // ============================================================================
 // 配置
 // ============================================================================
 
+// Config 隧道配置
 type Config struct {
-	ServerAddr string
-	PSK        string
-	TimeWindow int
-	LogLevel   string
-	MTU        int
-	SendWorkers int // 发送协程数，0 表示使用默认值
+	ServerAddr  string
+	PSK         string
+	TimeWindow  int
+	LogLevel    string
+	MTU         int
+	SendWorkers int
+}
+
+// ConnectOptions 连接选项
+type ConnectOptions struct {
+	Network    string
+	Address    string
+	Port       uint16
+	InitData   []byte
+	Timeout    time.Duration
+	Optimistic bool
 }
 
 // ============================================================================
 // 构造函数
 // ============================================================================
 
+// New 创建隧道
 func New(cfg Config) (*Tunnel, error) {
 	addr, err := net.ResolveUDPAddr("udp", cfg.ServerAddr)
 	if err != nil {
@@ -137,17 +143,6 @@ func New(cfg Config) (*Tunnel, error) {
 	mtu := cfg.MTU
 	if mtu <= 0 {
 		mtu = RecommendedMTU
-	}
-
-	workers := cfg.SendWorkers
-	if workers <= 0 {
-		workers = runtime.NumCPU()
-		if workers > SendWorkerCount {
-			workers = SendWorkerCount
-		}
-		if workers < 2 {
-			workers = 2
-		}
 	}
 
 	t := &Tunnel{
@@ -176,6 +171,7 @@ func NewSimple(serverAddr, psk string, timeWindow int, logLevel string) (*Tunnel
 // 生命周期
 // ============================================================================
 
+// Start 启动隧道
 func (t *Tunnel) Start() error {
 	conn, err := net.DialUDP("udp", nil, t.serverAddr)
 	if err != nil {
@@ -190,10 +186,13 @@ func (t *Tunnel) Start() error {
 	t.wg.Add(1)
 	go t.recvLoop()
 
-	// 启动发送协程池 (优化点2)
+	// 启动发送协程池
 	workerCount := runtime.NumCPU()
 	if workerCount > SendWorkerCount {
 		workerCount = SendWorkerCount
+	}
+	if workerCount < 2 {
+		workerCount = 2
 	}
 	for i := 0; i < workerCount; i++ {
 		t.sendWg.Add(1)
@@ -210,10 +209,10 @@ func (t *Tunnel) Start() error {
 	return nil
 }
 
+// Stop 停止隧道
 func (t *Tunnel) Stop() {
 	close(t.stopCh)
 
-	// 等待发送队列清空
 	close(t.sendQueue)
 	t.sendWg.Wait()
 
@@ -226,7 +225,7 @@ func (t *Tunnel) Stop() {
 }
 
 // ============================================================================
-// 发送工作协程 (优化点2: 无锁发送)
+// 发送工作协程
 // ============================================================================
 
 func (t *Tunnel) sendWorker() {
@@ -253,7 +252,6 @@ func (t *Tunnel) sendWorker() {
 	}
 }
 
-// queueSend 将数据放入发送队列
 func (t *Tunnel) queueSend(data []byte) bool {
 	select {
 	case t.sendQueue <- sendTask{data: data}:
@@ -265,7 +263,6 @@ func (t *Tunnel) queueSend(data []byte) bool {
 	}
 }
 
-// queueSendUrgent 紧急发送（阻塞等待）
 func (t *Tunnel) queueSendUrgent(data []byte) {
 	select {
 	case t.sendQueue <- sendTask{data: data}:
@@ -277,16 +274,6 @@ func (t *Tunnel) queueSendUrgent(data []byte) {
 // 连接管理
 // ============================================================================
 
-// ConnectOptions 连接选项
-type ConnectOptions struct {
-	Network   string // "tcp" 或 "udp"
-	Address   string
-	Port      uint16
-	InitData  []byte        // 初始数据 (0-RTT)
-	Timeout   time.Duration // 超时时间
-	Optimistic bool         // 乐观模式 (不等待确认)
-}
-
 // Connect 建立连接
 func (t *Tunnel) Connect(opts ConnectOptions) (io.ReadWriteCloser, error) {
 	if opts.Timeout == 0 {
@@ -296,7 +283,8 @@ func (t *Tunnel) Connect(opts ConnectOptions) (io.ReadWriteCloser, error) {
 	reqID := atomic.AddUint32(&t.reqIDCounter, 1)
 	atomic.AddUint64(&t.stats.ConnectRequests, 1)
 
-	netByte := protocol.NetworkTCP
+	// 修复：明确指定类型为 byte
+	var netByte byte = protocol.NetworkTCP
 	if opts.Network == "udp" {
 		netByte = protocol.NetworkUDP
 	}
@@ -329,10 +317,8 @@ func (t *Tunnel) Connect(opts ConnectOptions) (io.ReadWriteCloser, error) {
 	t.log(logInfo, "连接请求: %s:%d (ID:%d, InitData:%d bytes)",
 		opts.Address, opts.Port, reqID, len(opts.InitData))
 
-	// ========== 优化点1: 乐观模式 ==========
+	// 乐观模式：立即返回
 	if opts.Optimistic {
-		// 立即返回，不等待服务端确认
-		// 适用于 TLS 等已有应用层确认的协议
 		pc.Connected.Store(true)
 		return &TunnelConn{tunnel: t, pc: pc}, nil
 	}
@@ -484,10 +470,12 @@ func (t *Tunnel) cleanupLoop() {
 // 工具方法
 // ============================================================================
 
+// GetMaxPayloadSize 获取最大载荷大小
 func (t *Tunnel) GetMaxPayloadSize() int {
 	return t.mtu - IPUDPHeaderSize - CryptoOverhead - ProtocolOverhead
 }
 
+// GetStats 获取统计信息
 func (t *Tunnel) GetStats() Stats {
 	return Stats{
 		PacketsSent:       atomic.LoadUint64(&t.stats.PacketsSent),
@@ -513,14 +501,14 @@ func (t *Tunnel) log(level int, format string, args ...interface{}) {
 // TunnelConn - 隧道连接
 // ============================================================================
 
+// TunnelConn 隧道连接
 type TunnelConn struct {
-	tunnel    *Tunnel
-	pc        *PendingConn
-	closed    atomic.Bool
-	writeBuf  []byte // 复用写缓冲
-	writeMu   sync.Mutex
+	tunnel *Tunnel
+	pc     *PendingConn
+	closed atomic.Bool
 }
 
+// Read 读取数据
 func (c *TunnelConn) Read(p []byte) (n int, err error) {
 	for {
 		select {
@@ -530,11 +518,10 @@ func (c *TunnelConn) Read(p []byte) (n int, err error) {
 				return 0, err
 			}
 
-			// 检查状态 (可能是连接确认或错误)
+			// 检查状态
 			if !c.pc.Connected.Load() {
 				if resp.Status == protocol.StatusSuccess {
 					c.pc.Connected.Store(true)
-					// 如果没有数据，继续等待
 					if len(resp.Data) == 0 {
 						continue
 					}
@@ -558,6 +545,7 @@ func (c *TunnelConn) Read(p []byte) (n int, err error) {
 	}
 }
 
+// Write 写入数据
 func (c *TunnelConn) Write(p []byte) (n int, err error) {
 	if c.closed.Load() {
 		return 0, io.ErrClosedPipe
@@ -565,7 +553,6 @@ func (c *TunnelConn) Write(p []byte) (n int, err error) {
 
 	maxPayload := c.tunnel.GetMaxPayloadSize()
 
-	// 大包分片
 	if len(p) > maxPayload {
 		return c.writeFragmented(p, maxPayload)
 	}
@@ -574,16 +561,13 @@ func (c *TunnelConn) Write(p []byte) (n int, err error) {
 }
 
 func (c *TunnelConn) writeSingle(p []byte) (int, error) {
-	// 构建数据请求
 	plain := protocol.BuildDataRequest(c.pc.ReqID, p)
 
-	// 加密
 	encrypted, err := c.tunnel.crypto.Encrypt(plain)
 	if err != nil {
 		return 0, err
 	}
 
-	// 入队发送 (无锁)
 	if !c.tunnel.queueSend(encrypted) {
 		return 0, fmt.Errorf("发送队列满")
 	}
@@ -618,12 +602,12 @@ func (c *TunnelConn) writeFragmented(p []byte, maxPayload int) (int, error) {
 	return totalSent, nil
 }
 
+// Close 关闭连接
 func (c *TunnelConn) Close() error {
 	if c.closed.Swap(true) {
 		return nil
 	}
 
-	// 发送关闭请求
 	plain := protocol.BuildCloseRequest(c.pc.ReqID)
 	encrypted, err := c.tunnel.crypto.Encrypt(plain)
 	if err == nil {
@@ -633,7 +617,3 @@ func (c *TunnelConn) Close() error {
 	c.tunnel.closeConn(c.pc.ReqID)
 	return nil
 }
-
-
-
-
