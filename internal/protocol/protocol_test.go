@@ -1,6 +1,3 @@
-
-
-
 package protocol
 
 import (
@@ -73,21 +70,22 @@ func TestBuildCloseRequest(t *testing.T) {
 	}
 }
 
-func TestParseResponse(t *testing.T) {
-	// 模拟服务端响应
-	respData := make([]byte, 6+5)
-	respData[0] = TypeData // 服务端响应固定为 TypeData
+// TestParseConnectResponse 测试解析连接响应
+// 连接响应格式: Type(1, 0x04) + ReqID(4) + Status(1)
+func TestParseConnectResponse(t *testing.T) {
+	// 构建连接响应
+	respData := make([]byte, 6)
+	respData[0] = TypeConnectResp // 0x04
 	binary.BigEndian.PutUint32(respData[1:5], 12345)
 	respData[5] = StatusSuccess
-	copy(respData[6:], []byte("hello"))
 
 	resp, err := ParseResponse(respData)
 	if err != nil {
 		t.Fatalf("解析失败: %v", err)
 	}
 
-	if resp.Type != TypeData {
-		t.Errorf("Type 错误: %d", resp.Type)
+	if resp.Type != TypeConnectResp {
+		t.Errorf("Type 错误: 0x%02x, 期望 0x%02x", resp.Type, TypeConnectResp)
 	}
 	if resp.ReqID != 12345 {
 		t.Errorf("ReqID 错误: %d", resp.ReqID)
@@ -95,14 +93,137 @@ func TestParseResponse(t *testing.T) {
 	if resp.Status != StatusSuccess {
 		t.Errorf("Status 错误: %d", resp.Status)
 	}
-	if string(resp.Data) != "hello" {
-		t.Errorf("Data 错误: %s", resp.Data)
+}
+
+// TestParseConnectResponseFailed 测试解析失败的连接响应
+func TestParseConnectResponseFailed(t *testing.T) {
+	respData := make([]byte, 6)
+	respData[0] = TypeConnectResp // 0x04
+	binary.BigEndian.PutUint32(respData[1:5], 12345)
+	respData[5] = StatusFailed // 失败状态
+
+	resp, err := ParseResponse(respData)
+	if err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+
+	if resp.Status != StatusFailed {
+		t.Errorf("Status 应该是失败: %d", resp.Status)
 	}
 }
 
-func TestParseResponseFailed(t *testing.T) {
+// TestParseDataResponse 测试解析数据响应
+// 数据响应格式: Type(1, 0x02) + ReqID(4) + Data(N)
+func TestParseDataResponse(t *testing.T) {
+	payload := []byte("hello")
+	// 数据响应没有 Status 字段
+	respData := make([]byte, 5+len(payload))
+	respData[0] = TypeData // 0x02
+	binary.BigEndian.PutUint32(respData[1:5], 12345)
+	copy(respData[5:], payload)
+
+	resp, err := ParseResponse(respData)
+	if err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+
+	if resp.Type != TypeData {
+		t.Errorf("Type 错误: 0x%02x, 期望 0x%02x", resp.Type, TypeData)
+	}
+	if resp.ReqID != 12345 {
+		t.Errorf("ReqID 错误: %d", resp.ReqID)
+	}
+	// 数据响应的 Status 固定为 Success
+	if resp.Status != StatusSuccess {
+		t.Errorf("Status 错误: %d", resp.Status)
+	}
+	if string(resp.Data) != string(payload) {
+		t.Errorf("Data 错误: got %q, want %q", resp.Data, payload)
+	}
+}
+
+// TestParseCloseResponse 测试解析关闭响应
+func TestParseCloseResponse(t *testing.T) {
+	respData := make([]byte, 5)
+	respData[0] = TypeClose
+	binary.BigEndian.PutUint32(respData[1:5], 12345)
+
+	resp, err := ParseResponse(respData)
+	if err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+
+	if resp.Type != TypeClose {
+		t.Errorf("Type 错误: 0x%02x", resp.Type)
+	}
+	if resp.ReqID != 12345 {
+		t.Errorf("ReqID 错误: %d", resp.ReqID)
+	}
+}
+
+// TestParseResponseUnknownType 测试解析未知类型
+func TestParseResponseUnknownType(t *testing.T) {
 	respData := make([]byte, 6)
-	respData[0] = TypeData
+	respData[0] = 0xFF // 未知类型
+	binary.BigEndian.PutUint32(respData[1:5], 12345)
+
+	_, err := ParseResponse(respData)
+	if err == nil {
+		t.Error("应该返回错误")
+	}
+}
+
+// TestParseResponseTooShort 测试数据太短的情况
+func TestParseResponseTooShort(t *testing.T) {
+	respData := make([]byte, 3) // 太短
+
+	_, err := ParseResponse(respData)
+	if err == nil {
+		t.Error("应该返回错误")
+	}
+}
+
+// TestParseResponse 保留原测试名，但更新为正确的格式
+func TestParseResponse(t *testing.T) {
+	// 测试连接响应
+	t.Run("ConnectResponse", func(t *testing.T) {
+		respData := make([]byte, 6)
+		respData[0] = TypeConnectResp
+		binary.BigEndian.PutUint32(respData[1:5], 12345)
+		respData[5] = StatusSuccess
+
+		resp, err := ParseResponse(respData)
+		if err != nil {
+			t.Fatalf("解析失败: %v", err)
+		}
+		if resp.Status != StatusSuccess {
+			t.Errorf("Status 错误: %d", resp.Status)
+		}
+	})
+
+	// 测试数据响应
+	t.Run("DataResponse", func(t *testing.T) {
+		payload := []byte("hello")
+		respData := make([]byte, 5+len(payload))
+		respData[0] = TypeData
+		binary.BigEndian.PutUint32(respData[1:5], 12345)
+		copy(respData[5:], payload)
+
+		resp, err := ParseResponse(respData)
+		if err != nil {
+			t.Fatalf("解析失败: %v", err)
+		}
+		if string(resp.Data) != "hello" {
+			t.Errorf("Data 错误: %s", resp.Data)
+		}
+	})
+}
+
+// TestParseResponseFailed 保留原测试名，但更新为正确的格式
+func TestParseResponseFailed(t *testing.T) {
+	// 测试失败的连接响应
+	respData := make([]byte, 6)
+	respData[0] = TypeConnectResp // 使用连接响应类型
 	binary.BigEndian.PutUint32(respData[1:5], 12345)
 	respData[5] = StatusFailed
 
@@ -115,5 +236,3 @@ func TestParseResponseFailed(t *testing.T) {
 		t.Errorf("Status 应该是失败: %d", resp.Status)
 	}
 }
-
-
