@@ -191,10 +191,10 @@ func (t *Tunnel) Connect(opts ConnectOptions) (io.ReadWriteCloser, error) {
 	}
 
 	// 标准模式：等待服务端确认
-	respData, err := conn.readResponse(opts.Timeout)
+	respData, err := conn.readResponse()
 	if err != nil {
 		conn.Close()
-		return nil, fmt.Errorf("等待响应超时: %w", err)
+		return nil, fmt.Errorf("等待响应失败: %w", err)
 	}
 
 	resp, err := protocol.ParseResponse(respData)
@@ -265,7 +265,7 @@ type TunnelConn struct {
 }
 
 // readResponse 读取响应（内部使用）
-func (c *TunnelConn) readResponse(timeout time.Duration) ([]byte, error) {
+func (c *TunnelConn) readResponse() ([]byte, error) {
 	// 读取加密帧
 	encryptedFrame, err := c.tcpConn.ReadFrame()
 	if err != nil {
