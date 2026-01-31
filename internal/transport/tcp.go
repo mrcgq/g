@@ -11,14 +11,11 @@ import (
 )
 
 const (
-	// 长度前缀大小（2字节，最大 65535）
 	LengthPrefixSize = 2
-	// 最大包大小
-	MaxPacketSize = 65535
-	// 超时设置
-	ConnectTimeout = 10 * time.Second
-	ReadTimeout    = 5 * time.Minute
-	WriteTimeout   = 30 * time.Second
+	MaxPacketSize    = 65535
+	ConnectTimeout   = 10 * time.Second
+	ReadTimeout      = 5 * time.Minute
+	WriteTimeout     = 30 * time.Second
 )
 
 // TCPConn TCP 连接封装
@@ -41,7 +38,6 @@ func Dial(addr string, timeout time.Duration) (*TCPConn, error) {
 		return nil, fmt.Errorf("连接服务器失败: %w", err)
 	}
 
-	// 配置 TCP 连接
 	if tcpConn, ok := conn.(*net.TCPConn); ok {
 		_ = tcpConn.SetNoDelay(true)
 		_ = tcpConn.SetKeepAlive(true)
@@ -112,13 +108,11 @@ func NewFrameReader(conn net.Conn, timeout time.Duration) *FrameReader {
 }
 
 // ReadFrame 读取一个完整的帧
-// 格式: Length(2) + Data(Length)
 func (r *FrameReader) ReadFrame() ([]byte, error) {
 	if r.timeout > 0 {
 		_ = r.conn.SetReadDeadline(time.Now().Add(r.timeout))
 	}
 
-	// 读取长度前缀
 	lengthBuf := r.buf[:LengthPrefixSize]
 	if _, err := io.ReadFull(r.conn, lengthBuf); err != nil {
 		return nil, err
@@ -132,13 +126,11 @@ func (r *FrameReader) ReadFrame() ([]byte, error) {
 		return nil, fmt.Errorf("帧太大: %d", length)
 	}
 
-	// 读取数据
 	data := r.buf[LengthPrefixSize : LengthPrefixSize+length]
 	if _, err := io.ReadFull(r.conn, data); err != nil {
 		return nil, err
 	}
 
-	// 返回数据的副本
 	result := make([]byte, length)
 	copy(result, data)
 	return result, nil
@@ -174,11 +166,9 @@ func (w *FrameWriter) WriteFrame(data []byte) error {
 		_ = w.conn.SetWriteDeadline(time.Now().Add(w.timeout))
 	}
 
-	// 构建帧: Length(2) + Data
 	binary.BigEndian.PutUint16(w.buf[:LengthPrefixSize], uint16(len(data)))
 	copy(w.buf[LengthPrefixSize:], data)
 
-	// 写入
 	total := LengthPrefixSize + len(data)
 	_, err := w.conn.Write(w.buf[:total])
 	return err
