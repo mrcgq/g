@@ -1,4 +1,3 @@
-// internal/tunnel/tunnel.go
 package tunnel
 
 import (
@@ -153,20 +152,18 @@ func (t *Tunnel) Connect(opts ConnectOptions) (io.ReadWriteCloser, error) {
 	atomic.AddInt64(&t.stats.ActiveConns, 1)
 
 	if opts.Optimistic {
-		conn.connected.Store(true)
+		// 乐观模式：不等待连接响应，直接返回
+		// 但需要在第一次 Read 时处理连接响应
+		conn.connected.Store(false) // 标记为未确认连接
+		conn.optimistic = true
 		return conn, nil
 	}
 
-	respData, err := conn.readResponse()
+	// 非乐观模式：等待连接响应
+	resp, err := conn.waitConnectResponse()
 	if err != nil {
 		conn.Close()
-		return nil, fmt.Errorf("等待响应失败: %w", err)
-	}
-
-	resp, err := protocol.ParseResponse(respData)
-	if err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("解析响应失败: %w", err)
+		return nil, err
 	}
 
 	if resp.Status != protocol.StatusSuccess {
@@ -213,19 +210,21 @@ func (t *Tunnel) log(level int, format string, args ...interface{}) {
 }
 
 type TunnelConn struct {
-	tunnel    *Tunnel
-	tcpConn   *transport.TCPConn
-	reqID     uint32
-	connected atomic.Bool
-	closed    atomic.Bool
-	readBuf   []byte
-	readMu    sync.Mutex
+	tunnel     *Tunnel
+	tcpConn    *transport.TCPConn
+	reqID      uint32
+	connected  atomic.Bool
+	optimistic bool
+	closed     atomic.Bool
+	readBuf    []byte
+	readMu     sync.Mutex
 }
 
-func (c *TunnelConn) readResponse() ([]byte, error) {
+// waitConnectResponse 等待并解析连接响应
+func (c *TunnelConn) waitConnectResponse() (*protocol.Response, error) {
 	encryptedFrame, err := c.tcpConn.ReadFrame()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("读取连接响应失败: %w", err)
 	}
 
 	atomic.AddUint64(&c.tunnel.stats.PacketsRecv, 1)
@@ -233,16 +232,32 @@ func (c *TunnelConn) readResponse() ([]byte, error) {
 
 	plaintext, err := c.tunnel.crypto.Decrypt(encryptedFrame)
 	if err != nil {
-		return nil, fmt.Errorf("解密失败: %w", err)
+		return nil, fmt.Errorf("解密连接响应失败: %w", err)
 	}
 
-	return plaintext, nil
+	resp, err := protocol.ParseResponse(plaintext)
+	if err != nil {
+		return nil, fmt.Errorf("解析连接响应失败: %w", err)
+	}
+
+	// 验证是连接响应
+	if resp.Type != protocol.TypeConnectResp {
+		return nil, fmt.Errorf("期望连接响应(0x04)，收到: 0x%02x", resp.Type)
+	}
+
+	// 验证 ReqID
+	if resp.ReqID != c.reqID {
+		return nil, fmt.Errorf("ReqID 不匹配: 期望 %d，收到 %d", c.reqID, resp.ReqID)
+	}
+
+	return resp, nil
 }
 
 func (c *TunnelConn) Read(p []byte) (n int, err error) {
 	c.readMu.Lock()
 	defer c.readMu.Unlock()
 
+	// 如果有缓存数据，先返回
 	if len(c.readBuf) > 0 {
 		n = copy(p, c.readBuf)
 		c.readBuf = c.readBuf[n:]
@@ -277,29 +292,50 @@ func (c *TunnelConn) Read(p []byte) (n int, err error) {
 			continue
 		}
 
-		if !c.connected.Load() {
-			if resp.Status == protocol.StatusSuccess {
-				c.connected.Store(true)
-				if len(resp.Data) == 0 {
+		c.tunnel.log(logDebug, "收到响应: Type=0x%02x, ReqID=%d, Status=0x%02x, DataLen=%d",
+			resp.Type, resp.ReqID, resp.Status, len(resp.Data))
+
+		// 处理连接响应（乐观模式下第一个包可能是连接响应）
+		if resp.Type == protocol.TypeConnectResp {
+			if !c.connected.Load() {
+				if resp.Status == protocol.StatusSuccess {
+					c.connected.Store(true)
+					c.tunnel.log(logDebug, "连接确认成功: ID=%d", c.reqID)
+					// 连接响应通常没有数据，继续读取下一个包
 					continue
+				} else {
+					return 0, fmt.Errorf("连接被拒绝: status=0x%02x", resp.Status)
 				}
-			} else {
-				return 0, fmt.Errorf("连接失败: status=0x%02x", resp.Status)
 			}
+			// 已连接状态下收到连接响应，忽略
+			continue
 		}
 
-		if resp.Status == protocol.TypeClose {
+		// 处理关闭响应
+		if resp.Type == protocol.TypeClose {
 			return 0, io.EOF
 		}
 
-		if len(resp.Data) > 0 {
-			n = copy(p, resp.Data)
-			if n < len(resp.Data) {
-				c.readBuf = make([]byte, len(resp.Data)-n)
-				copy(c.readBuf, resp.Data[n:])
+		// 处理数据响应
+		if resp.Type == protocol.TypeData {
+			// 如果还没确认连接（乐观模式），先标记为已连接
+			if !c.connected.Load() {
+				c.connected.Store(true)
 			}
-			return n, nil
+
+			if len(resp.Data) > 0 {
+				n = copy(p, resp.Data)
+				if n < len(resp.Data) {
+					c.readBuf = make([]byte, len(resp.Data)-n)
+					copy(c.readBuf, resp.Data[n:])
+				}
+				return n, nil
+			}
+			// 空数据包，继续读取
+			continue
 		}
+
+		c.tunnel.log(logDebug, "忽略未知类型响应: 0x%02x", resp.Type)
 	}
 }
 
