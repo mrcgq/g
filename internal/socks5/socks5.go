@@ -24,9 +24,8 @@ const (
 	atypDomain    = 0x03
 	atypIPv6      = 0x04
 
-	// 0-RTT 相关
-	firstDataTimeout = 50 * time.Millisecond // 缩短等待时间
-	firstDataMaxSize = 2048                  // 增大首包缓冲
+	firstDataTimeout = 50 * time.Millisecond
+	firstDataMaxSize = 4096
 )
 
 type Server struct {
@@ -116,13 +115,11 @@ func (s *Server) handleConn(conn net.Conn) {
 
 	_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
 
-	// SOCKS5 握手
 	if err := s.handshake(conn); err != nil {
 		s.log(logDebug, "握手失败: %v", err)
 		return
 	}
 
-	// 读取请求
 	network, addr, port, err := s.readRequest(conn)
 	if err != nil {
 		s.log(logDebug, "读取请求失败: %v", err)
@@ -138,15 +135,10 @@ func (s *Server) handleConn(conn net.Conn) {
 	}
 }
 
-// handleOptimistic 乐观模式 (改进版)
 func (s *Server) handleOptimistic(conn net.Conn, network, addr string, port uint16) {
-	// 先发送 SOCKS5 成功响应
 	s.sendReply(conn, 0x00)
-
-	// 取消握手超时
 	_ = conn.SetDeadline(time.Time{})
 
-	// 尝试读取首包数据
 	var initData []byte
 	if network == "tcp" {
 		initData = s.tryReadFirstData(conn)
@@ -155,7 +147,6 @@ func (s *Server) handleOptimistic(conn net.Conn, network, addr string, port uint
 		}
 	}
 
-	// 通过隧道连接
 	remote, err := s.tunnel.Connect(tunnel.ConnectOptions{
 		Network:    network,
 		Address:    addr,
@@ -170,11 +161,9 @@ func (s *Server) handleOptimistic(conn net.Conn, network, addr string, port uint
 	}
 	defer remote.Close()
 
-	// 双向转发
 	s.relay(conn, remote)
 }
 
-// handleStandard 标准模式
 func (s *Server) handleStandard(conn net.Conn, network, addr string, port uint16) {
 	remote, err := s.tunnel.Connect(tunnel.ConnectOptions{
 		Network:    network,
@@ -185,7 +174,7 @@ func (s *Server) handleStandard(conn net.Conn, network, addr string, port uint16
 	})
 	if err != nil {
 		s.log(logDebug, "隧道连接失败: %v", err)
-		s.sendReply(conn, 0x05) // Connection refused
+		s.sendReply(conn, 0x05)
 		return
 	}
 	defer remote.Close()
@@ -195,7 +184,6 @@ func (s *Server) handleStandard(conn net.Conn, network, addr string, port uint16
 	s.relay(conn, remote)
 }
 
-// tryReadFirstData 尝试读取首包数据
 func (s *Server) tryReadFirstData(conn net.Conn) []byte {
 	_ = conn.SetReadDeadline(time.Now().Add(firstDataTimeout))
 	defer conn.SetReadDeadline(time.Time{})
@@ -312,14 +300,12 @@ func (s *Server) relay(local net.Conn, remote io.ReadWriteCloser) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// local -> remote
 	go func() {
 		defer wg.Done()
 		buf := make([]byte, 32*1024)
 		_, _ = io.CopyBuffer(remote, local, buf)
 	}()
 
-	// remote -> local
 	go func() {
 		defer wg.Done()
 		buf := make([]byte, 32*1024)
