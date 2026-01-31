@@ -13,21 +13,13 @@ import (
 	"github.com/anthropics/phantom-client/internal/transport"
 )
 
-// ============================================================================
-// 常量定义
-// ============================================================================
-
 const (
-	MaxPayloadSize = 32 * 1024 // TCP 没有 MTU 限制，可以更大
+	MaxPayloadSize = 32 * 1024
 
 	logError = 0
 	logInfo  = 1
 	logDebug = 2
 )
-
-// ============================================================================
-// Tunnel 主结构
-// ============================================================================
 
 type Tunnel struct {
 	serverAddr string
@@ -42,7 +34,6 @@ type Tunnel struct {
 	stats Stats
 }
 
-// Stats 统计信息
 type Stats struct {
 	PacketsSent     uint64
 	PacketsRecv     uint64
@@ -52,17 +43,11 @@ type Stats struct {
 	ActiveConns     int64
 }
 
-// ============================================================================
-// 配置
-// ============================================================================
-
 type Config struct {
-	ServerAddr  string
-	PSK         string
-	TimeWindow  int
-	LogLevel    string
-	MTU         int // 兼容旧配置，TCP 模式忽略
-	SendWorkers int // 兼容旧配置，TCP 模式忽略
+	ServerAddr string
+	PSK        string
+	TimeWindow int
+	LogLevel   string
 }
 
 type ConnectOptions struct {
@@ -73,10 +58,6 @@ type ConnectOptions struct {
 	Timeout    time.Duration
 	Optimistic bool
 }
-
-// ============================================================================
-// 构造函数
-// ============================================================================
 
 func New(cfg Config) (*Tunnel, error) {
 	cry, err := crypto.New(cfg.PSK, cfg.TimeWindow)
@@ -111,10 +92,6 @@ func NewSimple(serverAddr, psk string, timeWindow int, logLevel string) (*Tunnel
 	})
 }
 
-// ============================================================================
-// 生命周期
-// ============================================================================
-
 func (t *Tunnel) Start() error {
 	t.log(logInfo, "隧道已启动 (TCP模式), 服务器: %s", t.serverAddr)
 	return nil
@@ -125,10 +102,6 @@ func (t *Tunnel) Stop() {
 	t.wg.Wait()
 	t.log(logInfo, "隧道已停止")
 }
-
-// ============================================================================
-// 连接管理
-// ============================================================================
 
 func (t *Tunnel) Connect(opts ConnectOptions) (io.ReadWriteCloser, error) {
 	if opts.Timeout == 0 {
@@ -143,27 +116,23 @@ func (t *Tunnel) Connect(opts ConnectOptions) (io.ReadWriteCloser, error) {
 		netByte = protocol.NetworkUDP
 	}
 
-	// 建立到服务器的 TCP 连接
 	tcpConn, err := transport.Dial(t.serverAddr, opts.Timeout)
 	if err != nil {
 		return nil, fmt.Errorf("连接服务器失败: %w", err)
 	}
 
-	// 构建连接请求
 	connectReq, err := protocol.BuildConnectRequest(reqID, netByte, opts.Address, opts.Port, opts.InitData)
 	if err != nil {
 		tcpConn.Close()
 		return nil, fmt.Errorf("构建请求失败: %w", err)
 	}
 
-	// 加密
 	encrypted, err := t.crypto.Encrypt(connectReq)
 	if err != nil {
 		tcpConn.Close()
 		return nil, fmt.Errorf("加密失败: %w", err)
 	}
 
-	// 发送
 	if err := tcpConn.WriteFrame(encrypted); err != nil {
 		tcpConn.Close()
 		return nil, fmt.Errorf("发送 Connect 失败: %w", err)
@@ -175,7 +144,6 @@ func (t *Tunnel) Connect(opts ConnectOptions) (io.ReadWriteCloser, error) {
 	t.log(logInfo, "连接请求: %s:%d (ID:%d, InitData:%d bytes)",
 		opts.Address, opts.Port, reqID, len(opts.InitData))
 
-	// 创建隧道连接
 	conn := &TunnelConn{
 		tunnel:  t,
 		tcpConn: tcpConn,
@@ -184,13 +152,11 @@ func (t *Tunnel) Connect(opts ConnectOptions) (io.ReadWriteCloser, error) {
 
 	atomic.AddInt64(&t.stats.ActiveConns, 1)
 
-	// 乐观模式：直接返回，不等待服务端确认
 	if opts.Optimistic {
 		conn.connected.Store(true)
 		return conn, nil
 	}
 
-	// 标准模式：等待服务端确认
 	respData, err := conn.readResponse()
 	if err != nil {
 		conn.Close()
@@ -223,10 +189,6 @@ func (t *Tunnel) ConnectSimple(network, address string, port uint16, initData []
 	})
 }
 
-// ============================================================================
-// 工具方法
-// ============================================================================
-
 func (t *Tunnel) GetMaxPayloadSize() int {
 	return MaxPayloadSize
 }
@@ -250,23 +212,17 @@ func (t *Tunnel) log(level int, format string, args ...interface{}) {
 	fmt.Printf("%s %s %s\n", prefix, time.Now().Format("15:04:05"), fmt.Sprintf(format, args...))
 }
 
-// ============================================================================
-// TunnelConn - 隧道连接
-// ============================================================================
-
 type TunnelConn struct {
 	tunnel    *Tunnel
 	tcpConn   *transport.TCPConn
 	reqID     uint32
 	connected atomic.Bool
 	closed    atomic.Bool
-	readBuf   []byte // 缓存未读完的数据
+	readBuf   []byte
 	readMu    sync.Mutex
 }
 
-// readResponse 读取响应（内部使用）
 func (c *TunnelConn) readResponse() ([]byte, error) {
-	// 读取加密帧
 	encryptedFrame, err := c.tcpConn.ReadFrame()
 	if err != nil {
 		return nil, err
@@ -275,7 +231,6 @@ func (c *TunnelConn) readResponse() ([]byte, error) {
 	atomic.AddUint64(&c.tunnel.stats.PacketsRecv, 1)
 	atomic.AddUint64(&c.tunnel.stats.BytesRecv, uint64(len(encryptedFrame)))
 
-	// 解密
 	plaintext, err := c.tunnel.crypto.Decrypt(encryptedFrame)
 	if err != nil {
 		return nil, fmt.Errorf("解密失败: %w", err)
@@ -288,7 +243,6 @@ func (c *TunnelConn) Read(p []byte) (n int, err error) {
 	c.readMu.Lock()
 	defer c.readMu.Unlock()
 
-	// 如果有缓存的数据，先返回
 	if len(c.readBuf) > 0 {
 		n = copy(p, c.readBuf)
 		c.readBuf = c.readBuf[n:]
@@ -300,7 +254,6 @@ func (c *TunnelConn) Read(p []byte) (n int, err error) {
 			return 0, io.EOF
 		}
 
-		// 读取加密帧
 		encryptedFrame, err := c.tcpConn.ReadFrame()
 		if err != nil {
 			if c.closed.Load() {
@@ -312,42 +265,36 @@ func (c *TunnelConn) Read(p []byte) (n int, err error) {
 		atomic.AddUint64(&c.tunnel.stats.PacketsRecv, 1)
 		atomic.AddUint64(&c.tunnel.stats.BytesRecv, uint64(len(encryptedFrame)))
 
-		// 解密
 		plaintext, err := c.tunnel.crypto.Decrypt(encryptedFrame)
 		if err != nil {
 			c.tunnel.log(logDebug, "解密失败: %v", err)
 			continue
 		}
 
-		// 解析响应
 		resp, err := protocol.ParseResponse(plaintext)
 		if err != nil {
 			c.tunnel.log(logDebug, "解析响应失败: %v", err)
 			continue
 		}
 
-		// 处理连接确认（乐观模式下）
 		if !c.connected.Load() {
 			if resp.Status == protocol.StatusSuccess {
 				c.connected.Store(true)
 				if len(resp.Data) == 0 {
-					continue // 只是确认，没有数据
+					continue
 				}
 			} else {
 				return 0, fmt.Errorf("连接失败: status=0x%02x", resp.Status)
 			}
 		}
 
-		// 检查关闭
 		if resp.Status == protocol.TypeClose {
 			return 0, io.EOF
 		}
 
-		// 返回数据
 		if len(resp.Data) > 0 {
 			n = copy(p, resp.Data)
 			if n < len(resp.Data) {
-				// 数据没读完，缓存剩余部分
 				c.readBuf = make([]byte, len(resp.Data)-n)
 				copy(c.readBuf, resp.Data[n:])
 			}
@@ -361,16 +308,13 @@ func (c *TunnelConn) Write(p []byte) (n int, err error) {
 		return 0, io.ErrClosedPipe
 	}
 
-	// 构建数据请求
 	dataReq := protocol.BuildDataRequest(c.reqID, p)
 
-	// 加密
 	encrypted, err := c.tunnel.crypto.Encrypt(dataReq)
 	if err != nil {
 		return 0, fmt.Errorf("加密失败: %w", err)
 	}
 
-	// 发送
 	if err := c.tcpConn.WriteFrame(encrypted); err != nil {
 		return 0, err
 	}
@@ -386,13 +330,11 @@ func (c *TunnelConn) Close() error {
 		return nil
 	}
 
-	// 发送关闭请求
 	closeReq := protocol.BuildCloseRequest(c.reqID)
 	if encrypted, err := c.tunnel.crypto.Encrypt(closeReq); err == nil {
 		_ = c.tcpConn.WriteFrame(encrypted)
 	}
 
-	// 关闭 TCP 连接
 	c.tcpConn.Close()
 
 	atomic.AddInt64(&c.tunnel.stats.ActiveConns, -1)
