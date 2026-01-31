@@ -1,6 +1,3 @@
-
-
-
 package protocol
 
 import (
@@ -11,9 +8,10 @@ import (
 
 // 消息类型
 const (
-	TypeConnect = 0x01
-	TypeData    = 0x02
-	TypeClose   = 0x03
+	TypeConnect     = 0x01
+	TypeData        = 0x02
+	TypeClose       = 0x03
+	TypeConnectResp = 0x04 // ← 添加这个！与服务端一致
 )
 
 // 地址类型
@@ -47,22 +45,19 @@ type Request struct {
 
 // Response 响应结构
 type Response struct {
-	Type   byte   // 固定为 TypeData (0x02)
+	Type   byte
 	ReqID  uint32
 	Status byte
 	Data   []byte
 }
 
 // BuildConnectRequest 构建连接请求
-// 格式: Type(1) + ReqID(4) + Network(1) + AddrType(1) + Addr + Port(2) + [InitData]
 func BuildConnectRequest(reqID uint32, network byte, address string, port uint16, initData []byte) ([]byte, error) {
-	// 解析地址
 	addrType, addrBytes, err := encodeAddress(address)
 	if err != nil {
 		return nil, err
 	}
 
-	// 计算总长度
 	totalLen := 1 + 4 + 1 + 1 + len(addrBytes) + 2 + len(initData)
 	buf := make([]byte, totalLen)
 
@@ -93,7 +88,6 @@ func BuildConnectRequest(reqID uint32, network byte, address string, port uint16
 }
 
 // BuildDataRequest 构建数据请求
-// 格式: Type(1) + ReqID(4) + Payload
 func BuildDataRequest(reqID uint32, data []byte) []byte {
 	buf := make([]byte, 5+len(data))
 	buf[0] = TypeData
@@ -103,7 +97,6 @@ func BuildDataRequest(reqID uint32, data []byte) []byte {
 }
 
 // BuildCloseRequest 构建关闭请求
-// 格式: Type(1) + ReqID(4)
 func BuildCloseRequest(reqID uint32) []byte {
 	buf := make([]byte, 5)
 	buf[0] = TypeClose
@@ -112,25 +105,43 @@ func BuildCloseRequest(reqID uint32) []byte {
 }
 
 // ParseResponse 解析服务端响应
-// 格式: Type(1, 固定0x02) + ReqID(4) + Status(1) + [Data]
+// 连接响应格式: Type(1, 0x04) + ReqID(4) + Status(1)
+// 数据响应格式: Type(1, 0x02) + ReqID(4) + Data
 func ParseResponse(data []byte) (*Response, error) {
-	if len(data) < 6 {
+	if len(data) < 5 {
 		return nil, fmt.Errorf("响应数据太短: %d", len(data))
 	}
 
 	resp := &Response{
-		Type:   data[0],
-		ReqID:  binary.BigEndian.Uint32(data[1:5]),
-		Status: data[5],
+		Type:  data[0],
+		ReqID: binary.BigEndian.Uint32(data[1:5]),
 	}
 
-	// 注意: 服务端响应的 Type 固定为 TypeData (0x02)
-	if resp.Type != TypeData {
+	switch resp.Type {
+	case TypeConnectResp:
+		// 连接响应: Type(1) + ReqID(4) + Status(1)
+		if len(data) < 6 {
+			return nil, fmt.Errorf("连接响应数据太短: %d", len(data))
+		}
+		resp.Status = data[5]
+		if len(data) > 6 {
+			resp.Data = data[6:]
+		}
+
+	case TypeData:
+		// 数据响应: Type(1) + ReqID(4) + Data
+		// 注意：数据包没有 Status 字段
+		resp.Status = StatusSuccess
+		if len(data) > 5 {
+			resp.Data = data[5:]
+		}
+
+	case TypeClose:
+		// 关闭响应
+		resp.Status = StatusSuccess
+
+	default:
 		return nil, fmt.Errorf("未知响应类型: 0x%02x", resp.Type)
-	}
-
-	if len(data) > 6 {
-		resp.Data = data[6:]
 	}
 
 	return resp, nil
@@ -138,7 +149,6 @@ func ParseResponse(data []byte) (*Response, error) {
 
 // encodeAddress 编码地址
 func encodeAddress(address string) (addrType byte, addrBytes []byte, err error) {
-	// 尝试解析为 IP
 	ip := net.ParseIP(address)
 	if ip != nil {
 		if ip4 := ip.To4(); ip4 != nil {
@@ -149,7 +159,6 @@ func encodeAddress(address string) (addrType byte, addrBytes []byte, err error) 
 		}
 	}
 
-	// 域名
 	if len(address) > 255 {
 		return 0, nil, fmt.Errorf("域名太长: %d", len(address))
 	}
@@ -160,7 +169,7 @@ func encodeAddress(address string) (addrType byte, addrBytes []byte, err error) 
 	return AddrDomain, addrBytes, nil
 }
 
-// DecodeAddress 解码地址 (用于调试)
+// DecodeAddress 解码地址
 func DecodeAddress(addrType byte, data []byte) (string, int, error) {
 	switch addrType {
 	case AddrIPv4:
