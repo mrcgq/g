@@ -17,7 +17,7 @@ import (
 )
 
 var (
-	Version   = "3.2.0"
+	Version   = "3.3.0"
 	BuildTime = "unknown"
 	GitCommit = "unknown"
 )
@@ -28,10 +28,8 @@ type Config struct {
 	TimeWindow    int    `yaml:"time_window"`
 	Socks5        string `yaml:"socks5"`
 	LogLevel      string `yaml:"log_level"`
-	MTU           int    `yaml:"mtu"`
 	SkipTimeCheck bool   `yaml:"skip_time_check"`
 	Optimistic    bool   `yaml:"optimistic"`
-	SendWorkers   int    `yaml:"send_workers"`
 }
 
 func main() {
@@ -40,35 +38,30 @@ func main() {
 	serverFlag := flag.String("s", "", "服务器地址")
 	pskFlag := flag.String("psk", "", "PSK")
 	socksFlag := flag.String("socks5", "", "SOCKS5 监听地址")
-	mtuFlag := flag.Int("mtu", 0, "MTU 大小")
 	skipTimeCheck := flag.Bool("skip-time-check", false, "跳过时间同步检查")
 	noOptimistic := flag.Bool("no-optimistic", false, "禁用 0-RTT 优化")
 	showStats := flag.Bool("stats", false, "退出时显示统计信息")
 	flag.Parse()
 
 	if *showVersion {
-		fmt.Printf("Phantom Client v%s (ARQ)\n", Version)
+		fmt.Printf("Phantom Client v%s (TCP)\n", Version)
 		fmt.Printf("  Build: %s\n", BuildTime)
 		fmt.Printf("  Commit: %s\n", GitCommit)
-		fmt.Printf("  推荐 MTU: %d\n", tunnel.RecommendedMTU)
-		fmt.Printf("  最大载荷: %d bytes\n", tunnel.MaxPayloadSize)
 		fmt.Println("\n特性:")
-		fmt.Println("  - ARQ 可靠传输: 自动重传、排序、去重")
-		fmt.Println("  - 0-RTT 优化: 减少 TLS 连接延迟")
-		fmt.Println("  - 自动分片: 大包自动处理")
-		fmt.Println("  - RTT 自适应: 动态调整超时时间")
+		fmt.Println("  - TCP 可靠传输")
+		fmt.Println("  - TSKD 时间同步密钥派生")
+		fmt.Println("  - ChaCha20-Poly1305 加密")
+		fmt.Println("  - 0-RTT 乐观模式")
 		return
 	}
 
 	cfg, err := loadConfig(*configPath)
 	if err != nil {
 		cfg = &Config{
-			TimeWindow:  30,
-			Socks5:      "127.0.0.1:1080",
-			LogLevel:    "info",
-			MTU:         tunnel.RecommendedMTU,
-			Optimistic:  true,
-			SendWorkers: 4,
+			TimeWindow: 30,
+			Socks5:     "127.0.0.1:1080",
+			LogLevel:   "info",
+			Optimistic: true,
 		}
 	}
 
@@ -80,9 +73,6 @@ func main() {
 	}
 	if *socksFlag != "" {
 		cfg.Socks5 = *socksFlag
-	}
-	if *mtuFlag > 0 {
-		cfg.MTU = *mtuFlag
 	}
 	if *skipTimeCheck {
 		cfg.SkipTimeCheck = true
@@ -112,17 +102,11 @@ func main() {
 		fmt.Println("✓")
 	}
 
-	if cfg.MTU > 1400 {
-		fmt.Printf("警告: MTU=%d 较大，建议 %d\n", cfg.MTU, tunnel.RecommendedMTU)
-	}
-
 	tun, err := tunnel.New(tunnel.Config{
-		ServerAddr:  cfg.Server,
-		PSK:         cfg.PSK,
-		TimeWindow:  cfg.TimeWindow,
-		LogLevel:    cfg.LogLevel,
-		MTU:         cfg.MTU,
-		SendWorkers: cfg.SendWorkers,
+		ServerAddr: cfg.Server,
+		PSK:        cfg.PSK,
+		TimeWindow: cfg.TimeWindow,
+		LogLevel:   cfg.LogLevel,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "创建隧道失败: %v\n", err)
@@ -145,7 +129,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	printBanner(cfg, tun)
+	printBanner(cfg)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -174,12 +158,10 @@ func loadConfig(path string) (*Config, error) {
 	}
 
 	cfg := &Config{
-		TimeWindow:  30,
-		Socks5:      "127.0.0.1:1080",
-		LogLevel:    "info",
-		MTU:         tunnel.RecommendedMTU,
-		Optimistic:  true,
-		SendWorkers: 4,
+		TimeWindow: 30,
+		Socks5:     "127.0.0.1:1080",
+		LogLevel:   "info",
+		Optimistic: true,
 	}
 
 	if err := yaml.Unmarshal(data, cfg); err != nil {
@@ -189,7 +171,7 @@ func loadConfig(path string) (*Config, error) {
 	return cfg, nil
 }
 
-func printBanner(cfg *Config, tun *tunnel.Tunnel) {
+func printBanner(cfg *Config) {
 	optimisticStr := "关闭"
 	if cfg.Optimistic {
 		optimisticStr = "开启"
@@ -197,15 +179,14 @@ func printBanner(cfg *Config, tun *tunnel.Tunnel) {
 
 	fmt.Println()
 	fmt.Println("╔══════════════════════════════════════════════════════════╗")
-	fmt.Println("║            Phantom Client v3.2 (ARQ)                     ║")
+	fmt.Println("║            Phantom Client v3.3 (TCP)                     ║")
 	fmt.Println("║            极简 · 可靠传输 · 抗探测                      ║")
 	fmt.Println("╠══════════════════════════════════════════════════════════╣")
 	fmt.Printf("║  服务器: %-47s ║\n", cfg.Server)
 	fmt.Printf("║  SOCKS5: %-47s ║\n", cfg.Socks5)
-	fmt.Printf("║  MTU: %-50d ║\n", cfg.MTU)
 	fmt.Printf("║  0-RTT: %-48s ║\n", optimisticStr)
 	fmt.Println("╠══════════════════════════════════════════════════════════╣")
-	fmt.Println("║  特性: ARQ可靠传输 | 自动重传 | RTT自适应                ║")
+	fmt.Println("║  特性: TCP可靠传输 | TSKD加密 | 全密文无特征             ║")
 	fmt.Println("║  按 Ctrl+C 停止  |  --stats 查看统计                     ║")
 	fmt.Println("╚══════════════════════════════════════════════════════════╝")
 	fmt.Println()
@@ -220,9 +201,7 @@ func printStats(tun *tunnel.Tunnel) {
 	fmt.Printf("  发送字节: %s\n", formatBytes(stats.BytesSent))
 	fmt.Printf("  接收字节: %s\n", formatBytes(stats.BytesRecv))
 	fmt.Printf("  连接请求: %d\n", stats.ConnectRequests)
-	fmt.Printf("  分片包数: %d\n", stats.FragmentedPackets)
-	fmt.Printf("  ARQ重传: %d\n", stats.ARQRetrans)
-	fmt.Printf("  队列丢弃: %d\n", stats.QueueFullDrops)
+	fmt.Printf("  活跃连接: %d\n", stats.ActiveConns)
 	fmt.Println("═══════════════════════════════════════════════")
 }
 
